@@ -77,8 +77,8 @@ void ProxyThread::Start() {
 void ProxyThread::Shutdown() {
   if (!running_.load()) return;
   if (ring_) ring_->shutdown = 1;
-  running_.store(false);
   pthread_join(thread_, nullptr);
+  running_.store(false);
 }
 
 void* ProxyThread::ThreadFunc(void* arg) {
@@ -288,7 +288,7 @@ bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph, ibv_send_w
 }
 
 void ProxyThread::MainLoop() {
-  hipSetDevice(gpu_id_);
+  (void)hipSetDevice(gpu_id_);
 
   static constexpr int kMaxBatch = 64;
   ibv_send_wr wrs[kMaxBatch];
@@ -297,8 +297,13 @@ void ProxyThread::MainLoop() {
   uint32_t wr_qp[kMaxBatch];
   int batch_count = 0;
 
-  while (!ring_->shutdown) {
+  while (!ring_->shutdown || next_slot_ < ring_->gpu_head ||
+         ops_completed_ < ops_posted_) {
     batch_count = 0;
+
+    // KIWI-backed producers publish command descriptors through invoke. The
+    // callback materializes the legacy completion slot consumed below.
+    if (progress_hook_) progress_hook_();
 
     uint32_t head = ring_->gpu_head;
     while (next_slot_ < head && batch_count < kMaxBatch) {
@@ -329,6 +334,9 @@ void ProxyThread::MainLoop() {
 
     // Post the batch: group WRs by QP, chain each group, post with one ibv_post_send call
     if (batch_count > 0) {
+      // Count commands rather than ibv_post_send calls so shutdown can drain
+      // every signaled completion, including several WRs chained to one QP.
+      ops_posted_ += static_cast<uint64_t>(batch_count);
       // Build per-QP chains: chain_head[qi] points to first WR for that QP
       int chain_head[kMaxBatch];
       int chain_tail[kMaxBatch];
@@ -367,7 +375,6 @@ void ProxyThread::MainLoop() {
           int ret = ibv_post_send(qph.qp, to_post, &bad);
 
           if (ret == 0) {
-            ops_posted_++;
             break;
           }
 
@@ -386,7 +393,6 @@ void ProxyThread::MainLoop() {
               }
             }
             if (ret == 0) {
-              ops_posted_++;
               break;
             }
           }
@@ -395,6 +401,7 @@ void ProxyThread::MainLoop() {
           while (w) {
             uint32_t slot = static_cast<uint32_t>(w->wr_id) & PROXY_RING_MASK;
             ring_->cmds[slot].status = PROXY_ERROR;
+            ops_completed_++;
             w = w->next;
           }
           break;

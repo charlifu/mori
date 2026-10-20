@@ -329,7 +329,7 @@ def _get_gpu_archs() -> str:
     return ";".join(_supported_arch_list)
 
 
-def _copy_jit_sources(root_dir: Path) -> None:
+def _copy_jit_sources(root_dir: Path, kiwi_source_dir: "Path | None" = None) -> None:
     """Copy JIT-required source files into the package for wheel distribution.
 
     This creates python/mori/_jit-sources/ with the same directory structure
@@ -344,6 +344,16 @@ def _copy_jit_sources(root_dir: Path) -> None:
         shutil.copytree(src, dst, dirs_exist_ok=True, **kw)
 
     _copytree(root_dir / "include", jit_dir / "include")
+    if kiwi_source_dir is not None:
+        kiwi_include = kiwi_source_dir / "include" / "kiwi"
+        if not kiwi_include.is_dir():
+            raise RuntimeError(
+                f"BUILD_KIWI_PROXY=ON but KIWI headers are missing at {kiwi_include}"
+            )
+        _copytree(kiwi_include, jit_dir / "include" / "kiwi")
+        kiwi_license = root_dir / "LICENSES" / "kiwi-hcqueue.txt"
+        (jit_dir / "LICENSES").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(kiwi_license, jit_dir / "LICENSES" / kiwi_license.name)
 
     _copytree(root_dir / "src" / "ops" / "kernels", jit_dir / "src" / "ops" / "kernels")
     _copytree(
@@ -695,6 +705,8 @@ class CMakeBuild(build_ext):
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
+        build_kiwi_proxy = os.environ.get("BUILD_KIWI_PROXY", "OFF")
+        kiwi_source_env = os.environ.get("MORI_KIWI_SOURCE_DIR", "")
         with_mpi = (
             "ON"
             if (
@@ -754,12 +766,15 @@ class CMakeBuild(build_ext):
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
+            f"-DBUILD_KIWI_PROXY={build_kiwi_proxy}",
             f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
             "-B",
             str(build_dir),
             "-S",
             str(root_dir),
         ]
+        if kiwi_source_env:
+            cmake_args.append(f"-DMORI_KIWI_SOURCE_DIR={Path(kiwi_source_env).resolve()}")
 
         if shutil.which("ninja"):
             cmake_args.insert(1, "-G")
@@ -901,7 +916,14 @@ class CMakeBuild(build_ext):
             elif dst.exists():
                 dst.unlink()
 
-        _copy_jit_sources(root_dir)
+        kiwi_source_dir = None
+        if build_kiwi_proxy.upper() == "ON":
+            kiwi_source_dir = (
+                Path(kiwi_source_env).resolve()
+                if kiwi_source_env
+                else build_dir / "_deps" / "kiwi-src"
+            )
+        _copy_jit_sources(root_dir, kiwi_source_dir)
 
         # Persist the SDMA compile flag into the package so the runtime JIT
         # (mori.cco.device.bitcode) defaults to the SAME value the host lib was
@@ -1098,6 +1120,7 @@ mori_package_data = [
     "_jit-sources/src/**/*.h",
     "_jit-sources/3rdparty/**/*.h",
     "_jit-sources/3rdparty/**/*.hpp",
+    "_jit-sources/LICENSES/*",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
     "tools/*.sh",

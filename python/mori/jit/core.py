@@ -456,6 +456,8 @@ def _tunable_defines() -> list[str]:
     defs: list[str] = []
     if os.environ.get("MORI_ENABLE_HOST_PROXY") == "1":
         defs.append("-DMORI_PROXY_ENABLED")
+        if os.environ.get("MORI_HOST_PROXY_IMPL", "legacy").lower() == "kiwi":
+            defs.append("-DMORI_KIWI_PROXY_ENABLED")
     return defs
 
 

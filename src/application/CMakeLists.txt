@@ -78,6 +78,11 @@ list(
   topology/system.cpp
   transport/rdma/proxy/proxy_thread.cpp)
 
+if(BUILD_KIWI_PROXY)
+  list(APPEND MORI_APP_SOURCES
+       transport/rdma/proxy/kiwi_proxy_host.hip.cpp)
+endif()
+
 # libibverbs is loaded at runtime via dlopen (see ibv_shim.cpp), not linked. The
 # shim is built as an object library with hidden visibility so every mori shared
 # object that touches the verbs API embeds its own private copy and never
@@ -93,6 +98,10 @@ target_compile_options(mori_ibv_shim PRIVATE -fvisibility=hidden
 set_target_properties(mori_ibv_shim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_source_files_properties(${MORI_APP_SOURCES} PROPERTIES LANGUAGE CXX)
+if(BUILD_KIWI_PROXY)
+  set_source_files_properties(
+    transport/rdma/proxy/kiwi_proxy_host.hip.cpp PROPERTIES LANGUAGE HIP)
+endif()
 find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS ${ROCM_PATH}/lib /opt/rocm/lib REQUIRED)
 
 # Application sources are compiled once (PIC) into an OBJECT library, shared by:
@@ -107,6 +116,9 @@ target_include_directories(mori_application_objs PUBLIC ${CMAKE_SOURCE_DIR}/incl
 set_target_properties(mori_application_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(mori_application_objs PUBLIC hip::host dl mori_logging
                                                    ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
+if(BUILD_KIWI_PROXY)
+  target_link_libraries(mori_application_objs PUBLIC KIWI::invoke)
+endif()
 if(WITH_MPI)
   target_compile_definitions(mori_application_objs PUBLIC MORI_WITH_MPI)
   target_link_libraries(mori_application_objs PUBLIC MPI::MPI_CXX)
@@ -117,6 +129,9 @@ target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(mori_application PUBLIC hip::host dl mori_logging
                                               ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
+if(BUILD_KIWI_PROXY)
+  target_link_libraries(mori_application PRIVATE KIWI::invoke)
+endif()
 # Embed the libibverbs dlopen shim (object library, hidden visibility).
 target_link_libraries(mori_application PRIVATE mori_ibv_shim)
 
@@ -127,6 +142,9 @@ add_library(mori_application_static STATIC $<TARGET_OBJECTS:mori_application_obj
                                            $<TARGET_OBJECTS:mori_ibv_shim>)
 target_link_libraries(mori_application_static INTERFACE hip::host dl mori_logging
                                                         ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
+if(BUILD_KIWI_PROXY)
+  target_link_libraries(mori_application_static INTERFACE KIWI::invoke)
+endif()
 
 if(WITH_MPI)
   target_compile_definitions(mori_application PUBLIC MORI_WITH_MPI)

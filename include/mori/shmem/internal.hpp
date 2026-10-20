@@ -26,6 +26,7 @@
 
 #include "mori/application/application_device_types.hpp"
 #include "mori/core/transport/rdma/proxy/proxy_types.hpp"
+#include "mori/core/transport/rdma/proxy/kiwi_proxy.hpp"
 #include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/limits.hpp"
@@ -133,7 +134,9 @@ struct GpuStates {
   // Proxy fields — used when MORI_ENABLE_HOST_PROXY=1
   uint64_t _proxyPad{0};  // alignment padding
   core::ProxyRing* proxyRings[core::PROXY_MAX_NICS]{};
+  core::KiwiProxyDeviceState kiwiProxy[core::PROXY_MAX_NICS]{};
   uint32_t proxyQuietHead[core::PROXY_MAX_NICS]{};
+  bool kiwiProxyEnabled{false};
   int numProxyRings{0};
   int numNics{0};
   int localGpuIdx{0};

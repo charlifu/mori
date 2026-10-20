@@ -29,6 +29,7 @@
 #include <pthread.h>
 
 #include <atomic>
+#include <functional>
 #include <vector>
 
 #include "mori/core/transport/rdma/proxy/proxy_types.hpp"
@@ -60,6 +61,7 @@ class ProxyThread {
             uintptr_t heapEnd = 0);
   void Start();
   void Shutdown();
+  void SetProgressHook(std::function<void()> hook) { progress_hook_ = std::move(hook); }
 
  private:
   static void* ThreadFunc(void* arg);
@@ -78,6 +80,7 @@ class ProxyThread {
   int gpu_id_{0};
   uintptr_t heap_base_{0};
   uintptr_t heap_end_{0};
+  std::function<void()> progress_hook_;
 };
 
 }  // namespace core

@@ -58,6 +58,21 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   sdmaEnabled = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
   proxyEnabled = env::IsEnvVarEnabled("MORI_ENABLE_HOST_PROXY");
+  if (proxyEnabled) {
+    const char* impl = std::getenv("MORI_HOST_PROXY_IMPL");
+    const std::string proxyImpl = impl == nullptr ? "legacy" : impl;
+    if (proxyImpl != "legacy" && proxyImpl != "kiwi") {
+      throw std::invalid_argument(
+          "MORI_HOST_PROXY_IMPL must be 'legacy' or 'kiwi'");
+    }
+    kiwiProxyEnabled = proxyImpl == "kiwi";
+#ifndef MORI_BUILD_KIWI_PROXY
+    if (kiwiProxyEnabled) {
+      throw std::runtime_error(
+          "MORI_HOST_PROXY_IMPL=kiwi requires a BUILD_KIWI_PROXY=ON build");
+    }
+#endif
+  }
   CollectHostNames();
   if (env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL")) {
     railOnly = RailOnlyEligible();

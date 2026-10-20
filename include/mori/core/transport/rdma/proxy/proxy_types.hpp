@@ -56,6 +56,7 @@ enum ProxyCmdFlags : uint32_t {
 enum ProxyCmdStatus : uint32_t {
   PROXY_FREE = 0,
   PROXY_PENDING = 1,
+  PROXY_RESERVED = 2,
   PROXY_COMPLETED = 3,
   PROXY_ERROR = 4,
 };

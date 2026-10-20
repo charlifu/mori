@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -38,6 +39,9 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
+#ifdef MORI_BUILD_KIWI_PROXY
+#include "mori/core/transport/rdma/proxy/kiwi_proxy_host.hpp"
+#endif
 #include "mori/core/utils/utils.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
@@ -46,8 +50,25 @@
 namespace mori {
 namespace shmem {
 
-static std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;
-static void* proxyRingsHost[core::PROXY_MAX_NICS] = {};
+struct ProxyHostResources {
+  void* rings[core::PROXY_MAX_NICS]{};
+#ifdef MORI_BUILD_KIWI_PROXY
+  std::unique_ptr<core::KiwiProxyHostContext>
+      kiwiContexts[core::PROXY_MAX_NICS];
+#endif
+  // Declared last so static teardown destroys (and joins) threads before the
+  // contexts referenced by their progress hooks.
+  std::vector<std::unique_ptr<core::ProxyThread>> threads;
+};
+
+static ProxyHostResources proxyResources[mori::kMaxGpusPerNode];
+
+static ProxyHostResources& CurrentProxyResources() {
+  int device = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+  assert(device >= 0 && device < mori::kMaxGpusPerNode);
+  return proxyResources[device];
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      ShmemStatesSingleton                                     */
@@ -600,6 +621,7 @@ void GpuStateInit(ShmemStates* states) {
 
   // Check if IBGDA proxy mode is requested
   if (states->rdmaStates->commContext->IsProxyEnabled()) {
+    auto& proxy = CurrentProxyResources();
     MORI_SHMEM_INFO("Rank {}: CPU host proxy RDMA mode enabled", states->bootStates->rank);
     // Determine number of NICs for per-NIC ring allocation
     int numNics = 1;
@@ -612,7 +634,7 @@ void GpuStateInit(ShmemStates* states) {
 
     // Allocate one ProxyRing per NIC. Each ring has its own gpu_head so
     // GPU warps targeting different NICs don't contend on the same atomic.
-    // proxyRingsHost[] keeps the host pointer for the CPU proxy thread and cleanup.
+    // Per-device host resources keep pointers for the CPU thread and cleanup.
     // gpuStates.proxyRings[] stores the GPU device pointer for the GPU kernels.
     int allocated = 0;
     for (int n = 0; n < numNics; n++) {
@@ -624,9 +646,9 @@ void GpuStateInit(ShmemStates* states) {
                                             hipHostRegisterMapped | hipHostRegisterPortable);
         if (regErr == hipSuccess) {
           memset(ring, 0, sizeof(core::ProxyRing));
-          proxyRingsHost[n] = ring;
+          proxy.rings[n] = ring;
           void* ringDev = nullptr;
-          hipHostGetDevicePointer(&ringDev, ring, 0);
+          (void)hipHostGetDevicePointer(&ringDev, ring, 0);
           states->gpuStates.proxyRings[n] = ringDev ? static_cast<core::ProxyRing*>(ringDev) : ring;
           allocated++;
         } else {
@@ -637,6 +659,27 @@ void GpuStateInit(ShmemStates* states) {
     states->gpuStates.numProxyRings = allocated;
     states->gpuStates.numNics = numNics;
     states->gpuStates.localGpuIdx = states->gpuStates.rank % numNics;
+    states->gpuStates.kiwiProxyEnabled =
+        states->rdmaStates->commContext->IsKiwiProxyEnabled();
+#ifdef MORI_BUILD_KIWI_PROXY
+    if (states->gpuStates.kiwiProxyEnabled) {
+      constexpr size_t kKiwiQueueCapacityLines = 65536;
+      for (int n = 0; n < allocated; ++n) {
+        auto* ring = static_cast<core::ProxyRing*>(proxy.rings[n]);
+        auto context = std::make_unique<core::KiwiProxyHostContext>(
+            ring, kKiwiQueueCapacityLines);
+        states->gpuStates.kiwiProxy[n].context = context->DeviceContext();
+        states->gpuStates.kiwiProxy[n].callbackId = context->CallbackId();
+        proxy.kiwiContexts[n] = std::move(context);
+      }
+      MORI_SHMEM_INFO("Proxy: KIWI MPSC/invoke command path enabled; scalar Thread calls "
+                      "retain the legacy ring");
+    } else {
+      MORI_SHMEM_INFO("Proxy: legacy MORI command ring enabled");
+    }
+#else
+    MORI_SHMEM_INFO("Proxy: legacy MORI command ring enabled");
+#endif
     MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}", allocated, numNics,
                     states->gpuStates.localGpuIdx);
 
@@ -756,6 +799,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
 
   // Start per-NIC proxy threads if proxy mode is enabled
   if (states->rdmaStates->commContext->IsProxyEnabled() && states->gpuStates.numProxyRings > 0) {
+    auto& proxy = CurrentProxyResources();
     auto* ctx = states->rdmaStates->commContext;
     const auto& hostEndpoints = ctx->GetRdmaEndpoints();
     int numNics = states->gpuStates.numNics;
@@ -763,7 +807,8 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     const auto& perNicLkeys = states->memoryStates->symmMemMgr->perNicLkeys;
     const auto& perNicRkeys = states->memoryStates->symmMemMgr->perNicPeerRkeys;
     int myLocalGpu = states->gpuStates.localGpuIdx;
-    int gpuId = states->gpuStates.rank % numNics;
+    int gpuId = 0;
+    HIP_RUNTIME_CHECK(hipGetDevice(&gpuId));
 
     for (int n = 0; n < numNics; n++) {
       if (!states->gpuStates.proxyRings[n]) continue;
@@ -797,10 +842,16 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
       }
       if (nicQpCount > 0) {
         auto thread = std::make_unique<core::ProxyThread>();
-        thread->Init(static_cast<core::ProxyRing*>(proxyRingsHost[n]), std::move(nicQps), gpuId,
+        thread->Init(static_cast<core::ProxyRing*>(proxy.rings[n]), std::move(nicQps), gpuId,
                      states->gpuStates.heapBaseAddr, states->gpuStates.heapEndAddr);
+#ifdef MORI_BUILD_KIWI_PROXY
+        if (states->gpuStates.kiwiProxyEnabled && proxy.kiwiContexts[n]) {
+          auto* kiwiContext = proxy.kiwiContexts[n].get();
+          thread->SetProgressHook([kiwiContext]() { kiwiContext->Progress(64); });
+        }
+#endif
         thread->Start();
-        proxyThreads.push_back(std::move(thread));
+        proxy.threads.push_back(std::move(thread));
       }
     }
   }
@@ -819,21 +870,26 @@ bool ShmemIsInitialized() {
 /* ---------------------------------------------------------------------------------------------- */
 
 static void FinalizeGpuStates(ShmemStates* states) {
-  // Shutdown all per-NIC proxy threads before freeing rings
-  for (auto& t : proxyThreads) {
+  auto& proxy = CurrentProxyResources();
+  // Stop producers first, then let each proxy drain queued invokes and CQEs
+  // before destroying KIWI contexts or completion storage.
+  (void)hipDeviceSynchronize();
+  for (auto& t : proxy.threads) {
     if (t) t->Shutdown();
   }
-  proxyThreads.clear();
+  proxy.threads.clear();
+#ifdef MORI_BUILD_KIWI_PROXY
+  for (auto& context : proxy.kiwiContexts) context.reset();
+#endif
   for (int n = 0; n < core::PROXY_MAX_NICS; n++) {
-    if (proxyRingsHost[n]) {
-      hipHostUnregister(proxyRingsHost[n]);
-      free(proxyRingsHost[n]);
-      proxyRingsHost[n] = nullptr;
+    if (proxy.rings[n]) {
+      (void)hipHostUnregister(proxy.rings[n]);
+      free(proxy.rings[n]);
+      proxy.rings[n] = nullptr;
       states->gpuStates.proxyRings[n] = nullptr;
     }
   }
 
-  (void)hipDeviceSynchronize();
   (void)hipGetLastError();
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.rdmaEndpoints));

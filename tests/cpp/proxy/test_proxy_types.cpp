@@ -29,7 +29,10 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <type_traits>
 
+#include "mori/core/transport/rdma/proxy/kiwi_proxy.hpp"
 #include "mori/core/transport/rdma/proxy/proxy_types.hpp"
 
 using namespace mori::core;
@@ -43,6 +46,7 @@ void test_enum_values() {
 
   assert(PROXY_FREE == 0);
   assert(PROXY_PENDING == 1);
+  assert(PROXY_RESERVED == 2);
   assert(PROXY_COMPLETED == 3);
   assert(PROXY_ERROR == 4);
   printf("  enum_values: PASS\n");
@@ -75,53 +79,63 @@ void test_proxy_cmd_layout() {
 }
 
 void test_ring_constants() {
-  assert(PROXY_RING_SIZE == 1024);
-  assert(PROXY_RING_MASK == 1023);
+  assert(PROXY_RING_SIZE == 65536);
+  assert(PROXY_RING_MASK == 65535);
   assert((PROXY_RING_SIZE & PROXY_RING_MASK) == 0);
   printf("  ring_constants: PASS\n");
 }
 
 void test_ring_layout() {
   // Verify gpu_head and shutdown are on different cache lines
-  ProxyRing ring{};
-  uintptr_t head_off = (uintptr_t)&ring.gpu_head - (uintptr_t)&ring;
-  uintptr_t shut_off = (uintptr_t)&ring.shutdown - (uintptr_t)&ring;
+  auto ring = std::make_unique<ProxyRing>();
+  uintptr_t head_off = (uintptr_t)&ring->gpu_head - (uintptr_t)ring.get();
+  uintptr_t shut_off = (uintptr_t)&ring->shutdown - (uintptr_t)ring.get();
   assert(head_off == 0);
   assert(shut_off == 64);  // gpu_head(4) + pad1[15](60) = 64
 
-  assert(ring.gpu_head == 0);
-  assert(ring.shutdown == 0);
+  assert(ring->gpu_head == 0);
+  assert(ring->shutdown == 0);
 
   // All cmds should be zero-initialized
   for (uint32_t i = 0; i < PROXY_RING_SIZE; i++) {
-    assert(ring.cmds[i].status == PROXY_FREE);
-    assert(ring.cmds[i].op == PROXY_NOP);
+    assert(ring->cmds[i].status == PROXY_FREE);
+    assert(ring->cmds[i].op == PROXY_NOP);
   }
   printf("  ring_layout: PASS\n");
 }
 
 void test_ring_slot_independence() {
-  ProxyRing ring{};
+  auto ring = std::make_unique<ProxyRing>();
 
-  ring.cmds[0].status = PROXY_PENDING;
-  ring.cmds[0].op = PROXY_RDMA_WRITE;
-  ring.cmds[0].length = 100;
+  ring->cmds[0].status = PROXY_PENDING;
+  ring->cmds[0].op = PROXY_RDMA_WRITE;
+  ring->cmds[0].length = 100;
 
-  ring.cmds[1].status = PROXY_COMPLETED;
-  ring.cmds[1].op = PROXY_ATOMIC_FETCH_ADD;
-  ring.cmds[1].length = 8;
+  ring->cmds[1].status = PROXY_COMPLETED;
+  ring->cmds[1].op = PROXY_ATOMIC_FETCH_ADD;
+  ring->cmds[1].length = 8;
 
   // Slots are independent (128-byte aligned, no false sharing)
-  assert(ring.cmds[0].status == PROXY_PENDING);
-  assert(ring.cmds[0].length == 100);
-  assert(ring.cmds[1].status == PROXY_COMPLETED);
-  assert(ring.cmds[1].length == 8);
+  assert(ring->cmds[0].status == PROXY_PENDING);
+  assert(ring->cmds[0].length == 100);
+  assert(ring->cmds[1].status == PROXY_COMPLETED);
+  assert(ring->cmds[1].length == 8);
 
   // Wrap-around indexing
   uint32_t seq = PROXY_RING_SIZE + 5;
   uint32_t slot = seq & PROXY_RING_MASK;
   assert(slot == 5);
   printf("  ring_slot_independence: PASS\n");
+}
+
+void test_kiwi_descriptor_layout() {
+  static_assert(std::is_trivially_copyable_v<KiwiProxyCmd>);
+  assert(sizeof(KiwiProxyCmd) <= 512);
+  KiwiProxyCmd cmd{};
+  cmd.sequence = PROXY_RING_SIZE + 7;
+  cmd.op = PROXY_RDMA_WRITE;
+  assert((cmd.sequence & PROXY_RING_MASK) == 7);
+  printf("  kiwi_descriptor_layout: PASS\n");
 }
 
 void test_ring_size() {
@@ -137,6 +151,7 @@ int main() {
   test_ring_constants();
   test_ring_layout();
   test_ring_slot_independence();
+  test_kiwi_descriptor_layout();
   test_ring_size();
   printf("=== ALL PASS ===\n");
   return 0;

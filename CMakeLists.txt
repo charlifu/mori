@@ -69,6 +69,11 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
+option(BUILD_KIWI_PROXY
+       "Build the optional KIWI queue/invoke host-proxy backend" OFF)
+set(MORI_KIWI_SOURCE_DIR
+    ""
+    CACHE PATH "Optional local KIWI checkout (otherwise fetch the pinned revision)")
 option(MORI_MULTITHREAD_SUPPORT
        "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
 
@@ -221,6 +226,53 @@ set(SPDLOG_BUILD_BENCH
     OFF
     CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# KIWI contributes only its queue/invoke core.  Its LCI-backed P2P and EP
+# applications remain separate prototypes and must not become MORI dependencies.
+if(BUILD_KIWI_PROXY)
+  include(FetchContent)
+  set(KIWI_BUILD_INVOKE ON CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_P2P OFF CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_EP OFF CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_FLYDSL OFF CACHE BOOL "" FORCE)
+  set(KIWI_BUILD_TRITON OFF CACHE BOOL "" FORCE)
+  set(HIP_ARCHITECTURES "${GPU_TARGETS}" CACHE STRING "" FORCE)
+
+  if(MORI_KIWI_SOURCE_DIR)
+    FetchContent_Declare(kiwi SOURCE_DIR "${MORI_KIWI_SOURCE_DIR}")
+  else()
+    FetchContent_Declare(
+      kiwi
+      GIT_REPOSITORY https://github.com/AMD-RAD/kiwi.git
+      GIT_TAG 8b6b9f4be38c27b00b89b70fa91b561a051af917
+      GIT_SHALLOW FALSE)
+  endif()
+  FetchContent_MakeAvailable(kiwi)
+  # KIWI links its static queue implementation to the bare
+  # "hsa-runtime64" name. Resolve that private dependency here so consumers
+  # also link correctly when ROCm is installed outside the system search path.
+  find_library(MORI_KIWI_HSA_RUNTIME NAMES hsa-runtime64
+               HINTS ${ROCM_PATH}/lib /opt/rocm/lib REQUIRED)
+  get_target_property(MORI_KIWI_QUEUE_LINK_LIBS kiwi_queue_impl LINK_LIBRARIES)
+  list(REMOVE_ITEM MORI_KIWI_QUEUE_LINK_LIBS hsa-runtime64)
+  list(APPEND MORI_KIWI_QUEUE_LINK_LIBS "${MORI_KIWI_HSA_RUNTIME}")
+  set_target_properties(
+    kiwi_queue_impl PROPERTIES LINK_LIBRARIES "${MORI_KIWI_QUEUE_LINK_LIBS}")
+  get_target_property(MORI_KIWI_QUEUE_INTERFACE_LIBS kiwi_queue_impl
+                      INTERFACE_LINK_LIBRARIES)
+  string(REPLACE "hsa-runtime64" "${MORI_KIWI_HSA_RUNTIME}"
+                 MORI_KIWI_QUEUE_INTERFACE_LIBS
+                 "${MORI_KIWI_QUEUE_INTERFACE_LIBS}")
+  set_target_properties(
+    kiwi_queue_impl
+    PROPERTIES INTERFACE_LINK_LIBRARIES "${MORI_KIWI_QUEUE_INTERFACE_LIBS}")
+  add_compile_definitions(MORI_BUILD_KIWI_PROXY=1)
+endif()
+
 add_subdirectory(3rdparty/spdlog)
 # Hide spdlog symbols to avoid cross-library symbol collisions. Both rocroller
 # (via hipblaslt/TE) and MORI statically link spdlog; if both export spdlog

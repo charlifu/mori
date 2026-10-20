@@ -36,6 +36,38 @@ target_include_directories(test_flat_yaml PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_flat_yaml PRIVATE gtest_main)
 add_test(NAME flat_yaml COMMAND test_flat_yaml)
 
+if(BUILD_KIWI_PROXY)
+  add_executable(test_proxy_types proxy/test_proxy_types.cpp)
+  target_include_directories(test_proxy_types PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(test_proxy_types PRIVATE KIWI::invoke)
+  add_test(NAME proxy_types COMMAND test_proxy_types)
+
+  add_library(test_kiwi_proxy_device_compile OBJECT
+              proxy/test_kiwi_proxy_device_compile.hip.cpp)
+  set_source_files_properties(
+    proxy/test_kiwi_proxy_device_compile.hip.cpp PROPERTIES LANGUAGE HIP)
+  target_include_directories(test_kiwi_proxy_device_compile
+                             PRIVATE ${CMAKE_SOURCE_DIR}/include
+                                     ${CMAKE_SOURCE_DIR})
+  target_compile_definitions(test_kiwi_proxy_device_compile
+                             PRIVATE MORI_PROXY_ENABLED
+                                     MORI_KIWI_PROXY_ENABLED)
+  target_link_libraries(test_kiwi_proxy_device_compile PRIVATE KIWI::invoke)
+
+  add_executable(test_kiwi_proxy_bridge
+                 proxy/test_kiwi_proxy_bridge.hip.cpp)
+  set_source_files_properties(proxy/test_kiwi_proxy_bridge.hip.cpp
+                              PROPERTIES LANGUAGE HIP)
+  target_include_directories(test_kiwi_proxy_bridge
+                             PRIVATE ${CMAKE_SOURCE_DIR}/include
+                                     ${CMAKE_SOURCE_DIR})
+  target_compile_definitions(test_kiwi_proxy_bridge
+                             PRIVATE MORI_KIWI_PROXY_ENABLED)
+  target_link_libraries(test_kiwi_proxy_bridge PRIVATE mori_application
+                                                       KIWI::invoke)
+  add_test(NAME kiwi_proxy_bridge COMMAND test_kiwi_proxy_bridge)
+endif()
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp

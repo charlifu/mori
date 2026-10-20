@@ -43,6 +43,31 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 namespace v1 {
 template <typename T>
+inline __device__ void ProxyAtomicNonFetchForActiveLanes(
+    const application::SymmMemObjPtr dest, size_t destOffset, T value,
+    core::atomicType op, int pe, int qpId, bool active) {
+#ifdef MORI_KIWI_PROXY_ENABLED
+  if (shmem::GetGlobalGpuStatesPtr()->kiwiProxyEnabled) {
+    uint64_t mask = __ballot(active) & __activemask();
+    while (mask != 0) {
+      int leader = __ffsll(static_cast<unsigned long long>(mask)) - 1;
+      size_t leaderOffset = __shfl(destOffset, leader);
+      T leaderValue = __shfl(value, leader);
+      int leaderPe = __shfl(pe, leader);
+      int leaderQp = __shfl(qpId, leader);
+      shmem::ShmemAtomicTypeNonFetchWarp<T>(dest, leaderOffset, leaderValue, op,
+                                            leaderPe, leaderQp);
+      mask &= ~(uint64_t{1} << leader);
+    }
+    return;
+  }
+#endif
+  if (active) {
+    shmem::ShmemAtomicTypeNonFetchThread<T>(dest, destOffset, value, op, pe, qpId);
+  }
+}
+
+template <typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
                                               int expId, int destPe, int& localPeTokenCounter) {
   DEF_COMMON_VARS;
@@ -166,9 +191,12 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
     if (DEDUP) {
-      for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
+      for (int tokenBase = startTokenIdx; tokenBase < endTokenIdx;
+           tokenBase += warpSize) {
+        int tokenId = tokenBase + laneId;
+        bool validToken = tokenId < endTokenIdx;
         bool shouldSend = false;
-        for (int e = 0; e < config.numExpertPerToken; e++) {
+        for (int e = 0; validToken && e < config.numExpertPerToken; e++) {
           index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
           if (laneExpert < 0) continue;
           int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
@@ -206,9 +234,12 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         if (laneId > 0) warpOffset = __popcll(mask << (warpSize - laneId));
         index_t destTokId = destTokIdOffset + warpOffset;
 
+        int count = 0;
+        size_t remoteIdx = 0;
+        size_t stagingTokOffset = 0;
+        int qpId = 0;
         if (shouldSend) {
           bool prev = (laneId > 0) ? ((mask >> (laneId - 1)) & 1ULL) : 0;
-          int count = 0;
           if (!prev) {
             count = 1;
             for (int i = laneId + 1; i < warpSize; i++) {
@@ -219,24 +250,36 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
               }
             }
           }
-          size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
+          remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
           if (count > 0) {
-            size_t stagingTokOffset = tokenId * xferBytes;
-            int qpId = (tokenId / warpSize) % config.numQpPerPe;
-            shmem::ShmemPutMemNbiSignalThread(
-                args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
-                args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, count * xferBytes,
-                args.interNodeChunkFlagMemObj,
-                (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
-                core::atomicType::AMO_ADD, proxyPe, qpId);
+            stagingTokOffset = tokenId * xferBytes;
+            qpId = (tokenId / warpSize) % config.numQpPerPe;
           }
           if (!args.replayMode) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
         }
+        uint64_t leaders = __ballot(count > 0) & __activemask();
+        while (leaders != 0) {
+          int leader = __ffsll(static_cast<unsigned long long>(leaders)) - 1;
+          size_t leaderRemoteIdx = __shfl(remoteIdx, leader);
+          size_t leaderStagingOffset = __shfl(stagingTokOffset, leader);
+          int leaderCount = __shfl(count, leader);
+          int leaderQp = __shfl(qpId, leader);
+          shmem::ShmemPutMemNbiSignalWarp(
+              args.interNodeV1TokBufs.dispatchInp, leaderRemoteIdx * xferBytes,
+              args.interNodeV1TokBufs.dispatchStaging, leaderStagingOffset,
+              leaderCount * xferBytes, args.interNodeChunkFlagMemObj,
+              (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
+              core::atomicType::AMO_ADD, proxyPe, leaderQp);
+          leaders &= ~(uint64_t{1} << leader);
+        }
       }
     } else {
-      for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
+      for (int tokenBase = startTokenIdx; tokenBase < endTokenIdx;
+           tokenBase += warpSize) {
+        int tokenId = tokenBase + laneId;
+        bool validToken = tokenId < endTokenIdx;
         bool shouldSend = false;
-        for (int e = 0; e < config.numExpertPerToken; e++) {
+        for (int e = 0; validToken && e < config.numExpertPerToken; e++) {
           index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
           if (laneExpert < 0) continue;
           int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
@@ -255,17 +298,15 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         index_t destTokIdOffset = flagSlotId * warpSize;
         index_t destTokId = destTokIdOffset + laneId;
 
-        size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
-        if (laneId == 0) {
-          index_t tokenNum = std::min(tokenId + warpSize, endTokenIdx) - tokenId;
-          size_t stagingTokOffset = tokenId * xferBytes;
-          int qpId = (tokenId / warpSize) % config.numQpPerPe;
-          shmem::ShmemPutMemNbiSignalThread(
-              args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
-              args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
-              args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-              tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
-        }
+        index_t tokenNum = std::min(tokenBase + warpSize, endTokenIdx) - tokenBase;
+        size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokIdOffset);
+        size_t stagingTokOffset = tokenBase * xferBytes;
+        int qpId = (tokenBase / warpSize) % config.numQpPerPe;
+        shmem::ShmemPutMemNbiSignalWarp(
+            args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
+            args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
+            args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+            tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
         if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
     }
@@ -275,14 +316,14 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   if (laneId == 0) finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
-    if (laneId < nNodes) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      index_t numTokenSignal =
-          core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
-                                                     myNode * sizeof(uint64_t), numTokenSignal,
-                                                     core::AMO_ADD, proxyPe);
-    }
+    bool active = laneId < nNodes;
+    int proxyPe =
+        active ? laneId * config.gpuPerNode + (config.rank % config.gpuPerNode) : 0;
+    index_t numTokenSignal =
+        active ? core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1 : 0;
+    ProxyAtomicNonFetchForActiveLanes<uint64_t>(
+        args.nodeRecvTokenNumMemObj, myNode * sizeof(uint64_t), numTokenSignal,
+        core::AMO_ADD, proxyPe, 0, active);
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
   }
 }
@@ -305,10 +346,12 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
 
-    for (int tokenId = chunkStartTokenIdx + laneId; tokenId < chunkEndTokenIdx;
-         tokenId += warpSize) {
+    for (int tokenBase = chunkStartTokenIdx; tokenBase < chunkEndTokenIdx;
+         tokenBase += warpSize) {
+      int tokenId = tokenBase + laneId;
+      bool validToken = tokenId < chunkEndTokenIdx;
       bool shouldSend = false;
-      for (int e = 0; e < config.numExpertPerToken; e++) {
+      for (int e = 0; validToken && e < config.numExpertPerToken; e++) {
         int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
                        config.numExpertPerRank / config.gpuPerNode;
         if (destNode == i) {
@@ -326,18 +369,16 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
       index_t destTokIdOffset = flagSlotId * warpSize;
       index_t destTokId = destTokIdOffset + laneId;
 
-      size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
-      if (laneId == 0) {
-        index_t tokenNum = std::min(tokenId + warpSize, chunkEndTokenIdx) - tokenId;
-        size_t stagingTokOffset = tokenId * xferBytes;
-        int qpId = (tokenId / warpSize) % config.numQpPerPe;
+      index_t tokenNum = std::min(tokenBase + warpSize, chunkEndTokenIdx) - tokenBase;
+      size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokIdOffset);
+      size_t stagingTokOffset = tokenBase * xferBytes;
+      int qpId = (tokenBase / warpSize) % config.numQpPerPe;
 
-        shmem::ShmemPutMemNbiSignalThread(
-            args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
-            args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
-            args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-            tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
-      }
+      shmem::ShmemPutMemNbiSignalWarp(
+          args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
+          args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
+          args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+          tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
   }
@@ -346,14 +387,14 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   if (laneId == 0) finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[1], 1);
   finishedWarp = __shfl(finishedWarp, 0);
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
-    if (laneId < nNodes) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      index_t numTokenSignal =
-          core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
-                                                     myNode * sizeof(uint64_t), numTokenSignal,
-                                                     core::AMO_ADD, proxyPe);
-    }
+    bool active = laneId < nNodes;
+    int proxyPe =
+        active ? laneId * config.gpuPerNode + (config.rank % config.gpuPerNode) : 0;
+    index_t numTokenSignal =
+        active ? core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1 : 0;
+    ProxyAtomicNonFetchForActiveLanes<uint64_t>(
+        args.nodeRecvTokenNumMemObj, myNode * sizeof(uint64_t), numTokenSignal,
+        core::AMO_ADD, proxyPe, 0, active);
     if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
   }
 }
@@ -1099,14 +1140,14 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
-    if ((laneId < nNodes) &&
-        (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      for (int i = 0; i < config.numQpPerPe; i++) {
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                       args.config.rank * sizeof(uint64_t), 1,
-                                                       core::AMO_ADD, proxyPe, i);
-      }
+    bool barrierActive = (laneId < nNodes) && (laneId != myNode);
+    int barrierPe = barrierActive
+                        ? laneId * config.gpuPerNode + (config.rank % config.gpuPerNode)
+                        : 0;
+    for (int i = 0; i < config.numQpPerPe; i++) {
+      ProxyAtomicNonFetchForActiveLanes<uint64_t>(
+          args.crossDeviceBarrierMemObj, args.config.rank * sizeof(uint64_t), 1,
+          core::AMO_ADD, barrierPe, i, barrierActive);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
@@ -1243,14 +1284,16 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
-    if ((laneId < nNodes) &&
-        (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      for (int i = 0; i < config.numQpPerPe; i++) {
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                       args.config.rank * sizeof(uint64_t), 1,
-                                                       core::AMO_ADD, proxyPe, i);
-      }
+    bool barrierActive = (laneId < nNodes) && (laneId != myNode);
+    int barrierPe = barrierActive
+                        ? laneId * config.gpuPerNode + (config.rank % config.gpuPerNode)
+                        : 0;
+    for (int i = 0; i < config.numQpPerPe; i++) {
+      ProxyAtomicNonFetchForActiveLanes<uint64_t>(
+          args.crossDeviceBarrierMemObj, args.config.rank * sizeof(uint64_t), 1,
+          core::AMO_ADD, barrierPe, i, barrierActive);
+    }
+    if (barrierActive) {
       __threadfence_system();
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;

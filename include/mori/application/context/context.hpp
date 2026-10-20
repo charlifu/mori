@@ -134,6 +134,7 @@ class Context {
   bool IsSdmaEnabled() const { return sdmaEnabled; }
   bool IsP2PDisabled() const { return p2pDisabled; }
   bool IsProxyEnabled() const { return proxyEnabled; }
+  bool IsKiwiProxyEnabled() const { return kiwiProxyEnabled; }
   bool IsRailOnly() const { return railOnly; }
 
   // Returns the initial RDMA endpoint set. Empty until BuildInitialEndpoints()
@@ -207,6 +208,7 @@ class Context {
   bool sdmaEnabled{false};
   bool p2pDisabled{false};
   bool proxyEnabled{false};
+  bool kiwiProxyEnabled{false};
   bool railOnly{false};
   std::string myHostname;
   std::vector<PeerInfo> peerInfos;
