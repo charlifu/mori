@@ -253,33 +253,33 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
       size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * xferBytes;
       size_t localOffset = SendBufSlotOffset(config, destPe, tokenChunkNum * qpId) * xferBytes;
 
-      if (laneId != 0) continue;
-
       if (isSdmaPeer) {
         // The SDMA backend does not implement put-with-signal, so keep the
         // put + explicit-signal path: post the payload here, and RecvTransfer
         // waits for its completion before publishing the signal separately.
-        if (myPe != destPe && thisChunkTokenNum > 0) {
+        if (laneId == 0 && myPe != destPe && thisChunkTokenNum > 0) {
           shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
                                       args.interNodeTokBufs.dispatchStaging, localOffset,
                                       thisChunkTokenNum * xferBytes, destPe, qpId);
         }
       } else {
+        // Warp APIs keep the full wavefront active, which the KIWI host-proxy
+        // command queue requires.
         size_t signalOffset = (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t);
         uint64_t signalValue = static_cast<uint64_t>(tokenNum + 1);
         if (thisChunkTokenNum <= 0 || myPe == destPe) {
           // Empty chunks and self peers need no remote payload transfer, but the
           // receiver still waits for a signal on every QP.
-          shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj, signalOffset, signalValue,
-                                            destPe, qpId);
+          shmem::ShmemPutUint64ImmNbiWarp(args.recvTokenNumMemObj, signalOffset, signalValue,
+                                          destPe, qpId);
         } else {
           // put-with-signal makes the payload visible to the receiver before the
           // signal, without an intervening quiet.
-          shmem::ShmemPutMemNbiSignalThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
-                                            args.interNodeTokBufs.dispatchStaging, localOffset,
-                                            thisChunkTokenNum * xferBytes, args.recvTokenNumMemObj,
-                                            signalOffset, signalValue, core::atomicType::AMO_SET,
-                                            destPe, qpId);
+          shmem::ShmemPutMemNbiSignalWarp(args.interNodeTokBufs.dispatchInp, remoteOffset,
+                                          args.interNodeTokBufs.dispatchStaging, localOffset,
+                                          thisChunkTokenNum * xferBytes, args.recvTokenNumMemObj,
+                                          signalOffset, signalValue, core::atomicType::AMO_SET,
+                                          destPe, qpId);
         }
       }
     }
@@ -524,28 +524,28 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
       size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * tokHiddenBytes;
       size_t localOffset = SendBufSlotOffset(config, destPe, tokenChunkNum * qpId) * tokHiddenBytes;
 
-      if (laneId != 0) continue;
-
       if (isSdmaPeer) {
         // The SDMA backend does not implement put-with-signal, so keep the
         // put + explicit-signal path: post the payload here, and RecvTransfer
         // waits for its completion before publishing the signal separately.
-        if (myPe != destPe && thisChunkTokenNum > 0) {
+        if (laneId == 0 && myPe != destPe && thisChunkTokenNum > 0) {
           shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.combineInp, remoteOffset,
                                       args.interNodeTokBufs.staging, localOffset,
                                       thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
         }
       } else {
+        // Warp APIs keep the full wavefront active, which the KIWI host-proxy
+        // command queue requires.
         size_t signalOffset = (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t);
         if (thisChunkTokenNum <= 0 || myPe == destPe) {
           // Empty chunks and self peers need no remote payload transfer, but the
           // receiver still waits for a signal on every QP.
-          shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj, signalOffset,
-                                            barrierFlag, destPe, qpId);
+          shmem::ShmemPutUint64ImmNbiWarp(args.crossDeviceBarrierMemObj, signalOffset,
+                                          barrierFlag, destPe, qpId);
         } else {
           // Put-with-signal makes the payload visible to the receiver before the
           // signal, without an intervening quiet.
-          shmem::ShmemPutMemNbiSignalThread(
+          shmem::ShmemPutMemNbiSignalWarp(
               args.interNodeTokBufs.combineInp, remoteOffset, args.interNodeTokBufs.staging,
               localOffset, thisChunkTokenNum * tokHiddenBytes, args.crossDeviceBarrierMemObj,
               signalOffset, barrierFlag, core::atomicType::AMO_SET, destPe, qpId);
