@@ -71,9 +71,6 @@ option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
 option(BUILD_KIWI_PROXY
        "Build the optional KIWI queue/invoke host-proxy backend" OFF)
-set(MORI_KIWI_SOURCE_DIR
-    ""
-    CACHE PATH "Optional local KIWI checkout (otherwise fetch the pinned revision)")
 option(MORI_MULTITHREAD_SUPPORT
        "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
 
@@ -242,15 +239,11 @@ if(BUILD_KIWI_PROXY)
   set(KIWI_BUILD_TRITON OFF CACHE BOOL "" FORCE)
   set(HIP_ARCHITECTURES "${GPU_TARGETS}" CACHE STRING "" FORCE)
 
-  if(MORI_KIWI_SOURCE_DIR)
-    FetchContent_Declare(kiwi SOURCE_DIR "${MORI_KIWI_SOURCE_DIR}")
-  else()
-    FetchContent_Declare(
-      kiwi
-      GIT_REPOSITORY https://github.com/AMD-RAD/kiwi.git
-      GIT_TAG 8b6b9f4be38c27b00b89b70fa91b561a051af917
-      GIT_SHALLOW FALSE)
-  endif()
+  FetchContent_Declare(
+    kiwi
+    GIT_REPOSITORY https://github.com/AMD-RAD/kiwi.git
+    GIT_TAG 8b6b9f4be38c27b00b89b70fa91b561a051af917
+    GIT_SHALLOW FALSE)
   FetchContent_MakeAvailable(kiwi)
   # KIWI links its static queue implementation to the bare
   # "hsa-runtime64" name. Resolve that private dependency here so consumers

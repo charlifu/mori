@@ -706,7 +706,6 @@ class CMakeBuild(build_ext):
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
         build_kiwi_proxy = os.environ.get("BUILD_KIWI_PROXY", "OFF")
-        kiwi_source_env = os.environ.get("MORI_KIWI_SOURCE_DIR", "")
         with_mpi = (
             "ON"
             if (
@@ -773,8 +772,6 @@ class CMakeBuild(build_ext):
             "-S",
             str(root_dir),
         ]
-        if kiwi_source_env:
-            cmake_args.append(f"-DMORI_KIWI_SOURCE_DIR={Path(kiwi_source_env).resolve()}")
 
         if shutil.which("ninja"):
             cmake_args.insert(1, "-G")
