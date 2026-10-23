@@ -446,6 +446,23 @@ TEST_F(SsdBackendTest, AbortReturnsTheStagingPage) {
   EXPECT_EQ(after[0].outcome, AllocateOutcome::kSuccessAllocated);
 }
 
+// A full arena fails puts with NO_SPACE, and nothing else on the peer reports
+// it: this counter (plus a sampled WARN) is the trace, and the reader-side
+// staging_slot_full_reject does not move.
+TEST_F(SsdBackendTest, APutRefusedForAFullArenaIsCounted) {
+  SsdBackend* backend = Start(/*staging_pages=*/1);
+  auto held = backend->BatchAllocate({AllocateRequest{"key-a", 1024}});
+  ASSERT_EQ(held[0].outcome, AllocateOutcome::kSuccessAllocated);
+
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 1024}})[0].outcome,
+              AllocateOutcome::kFailedNoSpace);
+  }
+  auto events = Samples(*backend, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL);
+  EXPECT_EQ(events["staging_put_full_reject"], 3u);
+  EXPECT_EQ(events["staging_slot_full_reject"], 0u);
+}
+
 TEST_F(SsdBackendTest, AbortIsIdempotent) {
   SsdBackend* backend = Start();
   auto allocated = backend->BatchAllocate({AllocateRequest{"key-a", 1024}});
@@ -1042,6 +1059,19 @@ TEST_F(SsdBackendExtentTest, WholeObjectLeaseServesAnExtentWithoutReading) {
   ASSERT_TRUE(got[0].found);
   EXPECT_EQ(got[0].covered_size, 0u) << "served from the whole-object lease";
   EXPECT_EQ(got[0].hold, whole[0].hold);
+  EXPECT_EQ(DeviceReadBytes(), before);
+}
+
+// A staged tier move is counted by the pool, so device_read stays loads only.
+TEST_F(SsdBackendExtentTest, StagedMigrationReadIsNotADeviceRead) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "k", Aperiodic(kObject)));
+  const uint64_t before = DeviceReadBytes();
+
+  ResolvedEntry moved;
+  ASSERT_TRUE(backend_->AcquireMigrationRead("k", &moved, /*allow_file_ref=*/false));
+  EXPECT_FALSE(moved.pages.empty()) << "staged, not a file ref";
+  backend_->ReleaseMigrationRead("k");
   EXPECT_EQ(DeviceReadBytes(), before);
 }
 
